@@ -9,10 +9,28 @@ import streamlit as st
 
 st.set_page_config(page_title="Spotify Listening Insights", page_icon="🎧", layout="wide")
 st.title("🎧 Spotify Listening Insights")
-st.caption("Drag in your Spotify Extended Streaming History folder to analyse it.")
+st.caption("Drag in your Spotify Extended Streaming History folder to analyse it, including genre insights.")
 
 def find_col(columns, options):
     return next((c for c in options if c in columns), None)
+
+
+@st.cache_data(show_spinner=False)
+def load_genres(path="artists_and_genres.csv"):
+    """Load the bundled artist-to-genre lookup table."""
+    try:
+        genres = pd.read_csv(path)
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["artist_key", "genre"])
+
+    required = {"artist", "genre"}
+    if not required.issubset(genres.columns):
+        raise ValueError("artists_and_genres.csv must contain 'artist' and 'genre' columns.")
+
+    genres = genres[["artist", "genre"]].dropna().copy()
+    genres["artist_key"] = genres["artist"].astype(str).str.strip().str.casefold()
+    genres["genre"] = genres["genre"].astype(str).str.strip()
+    return genres[["artist_key", "genre"]].drop_duplicates("artist_key")
 
 @st.cache_data(show_spinner=False)
 def load_history(files, threshold):
@@ -112,7 +130,21 @@ payload = tuple((f.name, f.getvalue()) for f in uploads)
 try:
     with st.spinner("Analysing your listening history..."):
         df = load_history(payload, threshold)
+
+        genre_lookup = load_genres()
+        df["artist_key"] = df["artist"].astype(str).str.strip().str.casefold()
+        df = df.merge(genre_lookup, on="artist_key", how="left")
+        df["genre"] = df["genre"].fillna("Unknown")
+        df = df.drop(columns=["artist_key"])
+
         artists, tracks = rankings(df)
+        artist_genres = (
+            df[["artist", "genre"]]
+            .drop_duplicates("artist")
+            .set_index("artist")["genre"]
+        )
+        artists["genre"] = artists["artist"].map(artist_genres).fillna("Unknown")
+        tracks["genre"] = tracks["artist"].map(artist_genres).fillna("Unknown")
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -132,8 +164,8 @@ cols[1].metric("Streams", f"{len(df):,}")
 cols[2].metric("Artists", f"{df['artist'].nunique():,}")
 cols[3].metric("Tracks", f"{df['track'].nunique():,}")
 
-overview, favourites, artist_tab, track_tab, habits, downloads = st.tabs(
-    ["Overview","Favourite songs","Artists","Tracks","Habits","Downloads"]
+overview, favourites, artist_tab, track_tab, genre_tab, habits, downloads = st.tabs(
+    ["Overview","Favourite songs","Artists","Tracks","Genres","Habits","Downloads"]
 )
 
 with overview:
@@ -164,6 +196,38 @@ with track_tab:
     st.bar_chart(shown.set_index("song")[["listening_hours"]].sort_values("listening_hours"), horizontal=True)
     st.dataframe(shown, use_container_width=True, hide_index=True)
 
+
+with genre_tab:
+    genre_summary = (
+        df.groupby("genre")
+        .agg(
+            listening_hours=("hours_played", "sum"),
+            streams=("track", "size"),
+            unique_artists=("artist", "nunique"),
+            meaningful_plays=("meaningful_play", "sum"),
+        )
+        .reset_index()
+        .sort_values("listening_hours", ascending=False)
+        .round(2)
+    )
+
+    known_plays = df["genre"].ne("Unknown").sum()
+    coverage = known_plays / len(df) * 100 if len(df) else 0
+
+    a, b, c = st.columns(3)
+    a.metric("Top genre", genre_summary.iloc[0]["genre"] if not genre_summary.empty else "—")
+    b.metric("Genres found", f"{df.loc[df['genre'] != 'Unknown', 'genre'].nunique():,}")
+    c.metric("Genre coverage", f"{coverage:.1f}%")
+
+    chart = (
+        genre_summary[genre_summary["genre"] != "Unknown"]
+        .head(top_n)
+        .set_index("genre")[["listening_hours"]]
+        .sort_values("listening_hours")
+    )
+    st.bar_chart(chart, horizontal=True)
+    st.dataframe(genre_summary, use_container_width=True, hide_index=True)
+
 with habits:
     hourly = df.groupby("hour")["hours_played"].sum().reindex(range(24), fill_value=0)
     order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -182,6 +246,7 @@ with downloads:
         "monthly_listening.csv": monthly,
         "top_artists.csv": artists,
         "fair_favourite_songs.csv": tracks,
+        "genre_summary.csv": genre_summary,
     })
     st.download_button(
         "Download all CSV reports",
@@ -190,4 +255,4 @@ with downloads:
         "application/zip",
         use_container_width=True,
     )
-    st.caption("Genres are not included because the Spotify history export has no genre field.")
+    st.caption("Genre data is matched from the bundled artists_and_genres.csv lookup file.")
